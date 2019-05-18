@@ -75,6 +75,9 @@ def show_ann(coco, img, ann_info):
 
 
 def get_dataset(data_cfg):
+    if data_cfg['type'] == 'MMTSVDataset':
+        return obj_from_dict(data_cfg, datasets)
+
     if data_cfg['type'] == 'RepeatDataset':
         return RepeatDataset(
             get_dataset(data_cfg['dataset']), data_cfg['times'])

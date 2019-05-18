@@ -1,8 +1,9 @@
-import os.path as osp
-
+from tqdm import tqdm
+import logging
 import mmcv
 import numpy as np
 from mmcv.parallel import DataContainer as DC
+import json
 from torch.utils.data import Dataset
 
 from .transforms import (ImageTransform, BboxTransform, MaskTransform,
@@ -11,33 +12,11 @@ from .utils import to_tensor, random_scale
 from .extra_aug import ExtraAugmentation
 
 
-class CustomDataset(Dataset):
-    """Custom dataset for detection.
-
-    Annotation format:
-    [
-        {
-            'filename': 'a.jpg',
-            'width': 1280,
-            'height': 720,
-            'ann': {
-                'bboxes': <np.ndarray> (n, 4),
-                'labels': <np.ndarray> (n, ),
-                'bboxes_ignore': <np.ndarray> (k, 4),
-                'labels_ignore': <np.ndarray> (k, 4) (optional field)
-            }
-        },
-        ...
-    ]
-
-    The `ann` field is optional for testing.
-    """
-
+class MMTSVDataset(Dataset):
     CLASSES = None
 
     def __init__(self,
-                 ann_file,
-                 img_prefix,
+                 data, split, version,
                  img_scale,
                  img_norm_cfg,
                  multiscale_mode='value',
@@ -54,21 +33,24 @@ class CustomDataset(Dataset):
                  extra_aug=None,
                  resize_keep_ratio=True,
                  test_mode=False):
-        # prefix of images path
-        self.img_prefix = img_prefix
 
-        # load annotations (and proposals)
-        self.img_infos = self.load_annotations(ann_file)
+        from qd.qd_pytorch import TSVSplitProperty
+        self.image_tsv = TSVSplitProperty(data, split, t=None, version=version)
+        self.label_tsv = TSVSplitProperty(data, split, t='label', version=version)
+        self.hw_tsv = TSVSplitProperty(data, split, t='hw')
+        from qd.tsv_io import TSVDataset
+        self.labelmap = TSVDataset(data).load_labelmap()
+        self.label_to_idx = {l: i + 1 for i, l in enumerate(self.labelmap)}
+
         if proposal_file is not None:
             self.proposals = self.load_proposals(proposal_file)
         else:
             self.proposals = None
         # filter images with no annotation during training
         if not test_mode:
-            valid_inds = self._filter_imgs()
-            self.img_infos = [self.img_infos[i] for i in valid_inds]
-            if self.proposals is not None:
-                self.proposals = [self.proposals[i] for i in valid_inds]
+            self.valid_inds = self._filter_imgs()
+        else:
+            self.valid_inds = None
 
         # (long_edge, short_edge) or [(long1, short1), (long2, short2), ...]
         self.img_scales = img_scale if isinstance(img_scale,
@@ -127,22 +109,60 @@ class CustomDataset(Dataset):
         self.resize_keep_ratio = resize_keep_ratio
 
     def __len__(self):
-        return len(self.img_infos)
-
-    def load_annotations(self, ann_file):
-        return mmcv.load(ann_file)
+        if self.valid_inds is not None:
+            return len(self.valid_inds)
+        else:
+            return len(self.hw_tsv)
 
     def load_proposals(self, proposal_file):
         return mmcv.load(proposal_file)
 
     def get_ann_info(self, idx):
-        return self.img_infos[idx]['ann']
+        if self.valid_inds is not None:
+            idx = self.valid_inds[idx]
+        _, str_rects = self.label_tsv[idx]
+        rects = json.loads(str_rects)
+        # make sure the width and height is at least 1. Note, we should put
+        # this logic in the function of computing the valid_index or solve it
+        # in the data preparation. we leave this logic here mainly for parity
+        # check of this class with the built-in custom/coco dataset
+        crowd_idx = [i for i, r in enumerate(rects) if r.get('iscrowd')
+                and r['rect'][2] - r['rect'][0] >= 0
+                and r['rect'][3] - r['rect'][1] >= 0]
+        non_crowd_idx = [i for i, r in enumerate(rects) if not r.get('iscrowd')
+                and r['rect'][2] - r['rect'][0] >= 0
+                and r['rect'][3] - r['rect'][1] >= 0]
+
+        bbox = np.array([rects[i]['rect'] for i in non_crowd_idx],
+                dtype=np.float32)
+        if len(bbox) == 0:
+            bbox = np.zeros((0, 4), dtype=np.float32)
+        labels = np.array([self.label_to_idx[rects[i]['class']] for i in non_crowd_idx],
+                dtype=np.int64)
+
+        bboxes_ignore = np.array([rects[i]['rect'] for i in crowd_idx],
+                dtype=np.float32)
+        if len(bboxes_ignore) == 0:
+            bboxes_ignore = np.zeros((0, 4), dtype=np.float32)
+        labels_ignore = np.array([self.label_to_idx[rects[i]['class']] for i
+                in non_crowd_idx], dtype=np.int64)
+
+        return {'bboxes': bbox,
+                'labels': labels,
+                'bboxes_ignore': bboxes_ignore,
+                'labels_ignore': labels_ignore}
 
     def _filter_imgs(self, min_size=32):
         """Filter images too small."""
         valid_inds = []
-        for i, img_info in enumerate(self.img_infos):
-            if min(img_info['width'], img_info['height']) >= min_size:
+        logging.info('filtering which image is valid')
+        for i in tqdm(range(len(self.hw_tsv))):
+            _, str_rects = self.label_tsv[i]
+            if len(json.loads(str_rects)) == 0:
+                continue
+            _, str_hw = self.hw_tsv[i]
+            h, w = [int(x) for x in str_hw.split(' ')]
+            if min(h, w) >= min_size:
                 valid_inds.append(i)
         return valid_inds
 
@@ -154,8 +174,8 @@ class CustomDataset(Dataset):
         """
         self.flag = np.zeros(len(self), dtype=np.uint8)
         for i in range(len(self)):
-            img_info = self.img_infos[i]
-            if img_info['width'] / img_info['height'] > 1:
+            h, w = self.read_hw(i)
+            if 1. * w / h > 1:
                 self.flag[i] = 1
 
     def _rand_another(self, idx):
@@ -173,9 +193,8 @@ class CustomDataset(Dataset):
             return data
 
     def prepare_train_img(self, idx):
-        img_info = self.img_infos[idx]
         # load image
-        img = mmcv.imread(osp.join(self.img_prefix, img_info['filename']))
+        img = self.read_image(idx)
         # load proposals if necessary
         if self.proposals is not None:
             proposals = self.proposals[idx][:self.num_max_proposals]
@@ -217,14 +236,15 @@ class CustomDataset(Dataset):
             img, img_scale, flip, keep_ratio=self.resize_keep_ratio)
         img = img.copy()
         if self.with_seg:
-            gt_seg = mmcv.imread(
-                osp.join(self.seg_prefix, img_info['file_name'].replace(
-                    'jpg', 'png')),
-                flag='unchanged')
-            gt_seg = self.seg_transform(gt_seg.squeeze(), img_scale, flip)
-            gt_seg = mmcv.imrescale(
-                gt_seg, self.seg_scale_factor, interpolation='nearest')
-            gt_seg = gt_seg[None, ...]
+            raise NotImplementedError()
+            #gt_seg = mmcv.imread(
+                #osp.join(self.seg_prefix, img_info['file_name'].replace(
+                    #'jpg', 'png')),
+                #flag='unchanged')
+            #gt_seg = self.seg_transform(gt_seg.squeeze(), img_scale, flip)
+            #gt_seg = mmcv.imrescale(
+                #gt_seg, self.seg_scale_factor, interpolation='nearest')
+            #gt_seg = gt_seg[None, ...]
         if self.proposals is not None:
             proposals = self.bbox_transform(proposals, img_shape, scale_factor,
                                             flip)
@@ -238,8 +258,8 @@ class CustomDataset(Dataset):
         if self.with_mask:
             gt_masks = self.mask_transform(ann['masks'], pad_shape,
                                            scale_factor, flip)
-
-        ori_shape = (img_info['height'], img_info['width'], 3)
+        h, w = self.read_hw(idx)
+        ori_shape = (h, w, 3)
         img_meta = dict(
             ori_shape=ori_shape,
             img_shape=img_shape,
@@ -259,15 +279,14 @@ class CustomDataset(Dataset):
             data['gt_bboxes_ignore'] = DC(to_tensor(gt_bboxes_ignore))
         if self.with_mask:
             data['gt_masks'] = DC(gt_masks, cpu_only=True)
-        if self.with_seg:
-            data['gt_semantic_seg'] = DC(to_tensor(gt_seg), stack=True)
-        data['id'] = img_info['id']
+        #if self.with_seg:
+            #data['gt_semantic_seg'] = DC(to_tensor(gt_seg), stack=True)
+        data['id'] = self.read_key(idx)
         return data
 
     def prepare_test_img(self, idx):
         """Prepare an image for testing (multi-scale and flipping)"""
-        img_info = self.img_infos[idx]
-        img = mmcv.imread(osp.join(self.img_prefix, img_info['filename']))
+        img = self.read_image(idx)
         if self.proposals is not None:
             proposal = self.proposals[idx][:self.num_max_proposals]
             if not (proposal.shape[1] == 4 or proposal.shape[1] == 5):
@@ -277,12 +296,14 @@ class CustomDataset(Dataset):
         else:
             proposal = None
 
+        img_h, img_w = self.read_hw(idx)
+
         def prepare_single(img, scale, flip, proposal=None):
             _img, img_shape, pad_shape, scale_factor = self.img_transform(
                 img, scale, flip, keep_ratio=self.resize_keep_ratio)
             _img = to_tensor(_img)
             _img_meta = dict(
-                ori_shape=(img_info['height'], img_info['width'], 3),
+                ori_shape=(img_h, img_w, 3),
                 img_shape=img_shape,
                 pad_shape=pad_shape,
                 scale_factor=scale_factor,
@@ -321,3 +342,23 @@ class CustomDataset(Dataset):
         if self.proposals is not None:
             data['proposals'] = proposals
         return data
+
+    def read_image(self, idx):
+        if self.valid_inds is not None:
+            idx = self.valid_inds[idx]
+        _, __, str_im = self.image_tsv[idx]
+        from qd.qd_common import img_from_base64
+        return img_from_base64(str_im)
+
+    def read_hw(self, idx):
+        if self.valid_inds is not None:
+            idx = self.valid_inds[idx]
+        _, str_hw = self.hw_tsv[idx]
+        return [int(x) for x in str_hw.split(' ')]
+
+    def read_key(self, idx):
+        if self.valid_inds is not None:
+            idx = self.valid_inds[idx]
+        key, _ = self.hw_tsv[idx]
+        return key
+
