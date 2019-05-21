@@ -39,8 +39,22 @@ class MMTSVDataset(Dataset):
         self.label_tsv = TSVSplitProperty(data, split, t='label', version=version)
         self.hw_tsv = TSVSplitProperty(data, split, t='hw')
         from qd.tsv_io import TSVDataset
-        self.labelmap = TSVDataset(data).load_labelmap()
-        self.label_to_idx = {l: i + 1 for i, l in enumerate(self.labelmap)}
+        dataset = TSVDataset(data)
+        self.CLASSES = dataset.load_labelmap()
+        self.label_to_idx = {l: i + 1 for i, l in enumerate(self.CLASSES)}
+
+        #if test_mode and data == 'coco2017Full':
+            # this is only used for parity check when the data is
+            # coco2017Full. In our code base, we do not require these fields
+            # we need to remove these codes once we can reliablely use our code
+            #logging.info('loading all image ids')
+            #self.img_ids = [int(self.hw_tsv[i][0]) for i in range(len(self.hw_tsv))]
+            #from qd.qd_common import load_from_yaml_file
+            #import os.path as op
+            #self.cat_to_id = dict([(x['name'], x['id']) for x in load_from_yaml_file(op.join(dataset._data_root,
+                #'coco_categories.yaml'))])
+            #from .coco import CocoDataset
+            #self.cat_ids = [self.cat_to_id[c.replace('_', ' ')] for c in CocoDataset.CLASSES]
 
         if proposal_file is not None:
             self.proposals = self.load_proposals(proposal_file)
@@ -174,7 +188,7 @@ class MMTSVDataset(Dataset):
         """
         self.flag = np.zeros(len(self), dtype=np.uint8)
         for i in range(len(self)):
-            h, w = self.read_hw(i)
+            _, h, w = self.read_hw(i)
             if 1. * w / h > 1:
                 self.flag[i] = 1
 
@@ -258,14 +272,16 @@ class MMTSVDataset(Dataset):
         if self.with_mask:
             gt_masks = self.mask_transform(ann['masks'], pad_shape,
                                            scale_factor, flip)
-        h, w = self.read_hw(idx)
+        key, h, w = self.read_hw(idx)
         ori_shape = (h, w, 3)
         img_meta = dict(
             ori_shape=ori_shape,
             img_shape=img_shape,
             pad_shape=pad_shape,
             scale_factor=scale_factor,
-            flip=flip)
+            flip=flip,
+            key=key,
+            )
 
         data = dict(
             img=DC(to_tensor(img), stack=True),
@@ -281,7 +297,6 @@ class MMTSVDataset(Dataset):
             data['gt_masks'] = DC(gt_masks, cpu_only=True)
         #if self.with_seg:
             #data['gt_semantic_seg'] = DC(to_tensor(gt_seg), stack=True)
-        data['id'] = self.read_key(idx)
         return data
 
     def prepare_test_img(self, idx):
@@ -296,7 +311,7 @@ class MMTSVDataset(Dataset):
         else:
             proposal = None
 
-        img_h, img_w = self.read_hw(idx)
+        key, img_h, img_w = self.read_hw(idx)
 
         def prepare_single(img, scale, flip, proposal=None):
             _img, img_shape, pad_shape, scale_factor = self.img_transform(
@@ -307,6 +322,7 @@ class MMTSVDataset(Dataset):
                 img_shape=img_shape,
                 pad_shape=pad_shape,
                 scale_factor=scale_factor,
+                key=key,
                 flip=flip)
             if proposal is not None:
                 if proposal.shape[1] == 5:
@@ -350,15 +366,12 @@ class MMTSVDataset(Dataset):
         from qd.qd_common import img_from_base64
         return img_from_base64(str_im)
 
+    def get_keys(self):
+        return [self.hw_tsv[i][0] for i in range(len(self.hw_tsv))]
+
     def read_hw(self, idx):
         if self.valid_inds is not None:
             idx = self.valid_inds[idx]
-        _, str_hw = self.hw_tsv[idx]
-        return [int(x) for x in str_hw.split(' ')]
-
-    def read_key(self, idx):
-        if self.valid_inds is not None:
-            idx = self.valid_inds[idx]
-        key, _ = self.hw_tsv[idx]
-        return key
-
+        key, str_hw = self.hw_tsv[idx]
+        hw = [int(x) for x in str_hw.split(' ')]
+        return key, hw[0], hw[1]

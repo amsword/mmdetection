@@ -168,7 +168,8 @@ def _dist_train(model, dataset, cfg, validate=False):
         runner.resume(cfg.resume_from)
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
-    runner.run(data_loaders, cfg.workflow, cfg.total_epochs)
+    max_iter = cfg._cfg_dict.get('max_iter')
+    runner.run(data_loaders, cfg.workflow, cfg.total_epochs, max_iter=max_iter)
 
 
 def _non_dist_train(model, dataset, cfg, validate=False):
@@ -194,4 +195,5 @@ def _non_dist_train(model, dataset, cfg, validate=False):
         runner.resume(cfg.resume_from)
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
-    runner.run(data_loaders, cfg.workflow, cfg.total_epochs)
+    max_iter = cfg._cfg_dict.get('max_iter')
+    runner.run(data_loaders, cfg.workflow, cfg.total_epochs, max_iter=max_iter)

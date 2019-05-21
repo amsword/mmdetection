@@ -245,6 +245,7 @@ class CustomDataset(Dataset):
             img_shape=img_shape,
             pad_shape=pad_shape,
             scale_factor=scale_factor,
+            key=str(img_info['id']),
             flip=flip)
 
         data = dict(
