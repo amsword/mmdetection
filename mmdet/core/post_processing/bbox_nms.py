@@ -8,7 +8,9 @@ def multiclass_nms(multi_bboxes,
                    score_thr,
                    nms_cfg,
                    max_num=-1,
-                   score_factors=None):
+                   score_factors=None,
+                   start_class=1,
+                   ):
     """NMS for multi-class bboxes.
 
     Args:
@@ -31,7 +33,8 @@ def multiclass_nms(multi_bboxes,
     nms_cfg_ = nms_cfg.copy()
     nms_type = nms_cfg_.pop('type', 'nms')
     nms_op = getattr(nms_wrapper, nms_type)
-    for i in range(1, num_classes):
+    assert start_class in [0, 1]
+    for i in range(start_class, num_classes):
         cls_inds = multi_scores[:, i] > score_thr
         if not cls_inds.any():
             continue
@@ -46,7 +49,7 @@ def multiclass_nms(multi_bboxes,
         cls_dets = torch.cat([_bboxes, _scores[:, None]], dim=1)
         cls_dets, _ = nms_op(cls_dets, **nms_cfg_)
         cls_labels = multi_bboxes.new_full((cls_dets.shape[0], ),
-                                           i - 1,
+                                           i - start_class,
                                            dtype=torch.long)
         bboxes.append(cls_dets)
         labels.append(cls_labels)

@@ -19,6 +19,8 @@ class MMTSVDataset(Dataset):
                  data, split, version,
                  img_scale,
                  img_norm_cfg,
+                 multi_hot_label=False,
+                 ignore_filter_img=False,
                  multiscale_mode='value',
                  size_divisor=None,
                  proposal_file=None,
@@ -61,7 +63,7 @@ class MMTSVDataset(Dataset):
         else:
             self.proposals = None
         # filter images with no annotation during training
-        if not test_mode:
+        if not test_mode and not ignore_filter_img:
             self.valid_inds = self._filter_imgs()
         else:
             self.valid_inds = None
@@ -121,6 +123,7 @@ class MMTSVDataset(Dataset):
 
         # image rescale if keep ratio
         self.resize_keep_ratio = resize_keep_ratio
+        self.multi_hot_label = multi_hot_label
 
     def __len__(self):
         if self.valid_inds is not None:
@@ -131,7 +134,57 @@ class MMTSVDataset(Dataset):
     def load_proposals(self, proposal_file):
         return mmcv.load(proposal_file)
 
+    def get_multi_hot_ann_info(self, idx):
+        if self.valid_inds is not None:
+            idx = self.valid_inds[idx]
+        _, str_rects = self.label_tsv[idx]
+        rects = json.loads(str_rects)
+        from qd.qd_common import merge_class_names_by_location_id
+        rects = merge_class_names_by_location_id(rects)
+        # make sure the width and height is at least 1. Note, we should put
+        # this logic in the function of computing the valid_index or solve it
+        # in the data preparation. we leave this logic here mainly for parity
+        # check of this class with the built-in custom/coco dataset
+        crowd_idx = [i for i, r in enumerate(rects) if r.get('iscrowd')
+                and r['rect'][2] - r['rect'][0] >= 0
+                and r['rect'][3] - r['rect'][1] >= 0]
+        non_crowd_idx = [i for i, r in enumerate(rects) if not r.get('iscrowd')
+                and r['rect'][2] - r['rect'][0] >= 0
+                and r['rect'][3] - r['rect'][1] >= 0]
+
+        bbox = np.array([rects[i]['rect'] for i in non_crowd_idx],
+                dtype=np.float32)
+        if len(bbox) == 0:
+            bbox = np.zeros((0, 4), dtype=np.float32)
+        def get_np_label(all_idx):
+            result = np.zeros((len(all_idx), len(self.label_to_idx)),
+                    dtype=np.int64)
+            for idx_row, idx_rect in enumerate(all_idx):
+                for c in rects[idx_rect]['class']:
+                    # self.label_to_idx is 1-based
+                    idx_class = self.label_to_idx[c] - 1
+                    result[idx_row][idx_class] = 1
+            return result
+        labels = get_np_label(non_crowd_idx)
+
+        bboxes_ignore = np.array([rects[i]['rect'] for i in crowd_idx],
+                dtype=np.float32)
+        if len(bboxes_ignore) == 0:
+            bboxes_ignore = np.zeros((0, 4), dtype=np.float32)
+        labels_ignore = get_np_label(non_crowd_idx)
+
+        return {'bboxes': bbox,
+                'labels': labels,
+                'bboxes_ignore': bboxes_ignore,
+                'labels_ignore': labels_ignore}
+
     def get_ann_info(self, idx):
+        if self.multi_hot_label:
+            return self.get_multi_hot_ann_info(idx)
+        else:
+            return self.get_single_hot_ann_info(idx)
+
+    def get_single_hot_ann_info(self, idx):
         if self.valid_inds is not None:
             idx = self.valid_inds[idx]
         _, str_rects = self.label_tsv[idx]
@@ -159,7 +212,7 @@ class MMTSVDataset(Dataset):
         if len(bboxes_ignore) == 0:
             bboxes_ignore = np.zeros((0, 4), dtype=np.float32)
         labels_ignore = np.array([self.label_to_idx[rects[i]['class']] for i
-                in non_crowd_idx], dtype=np.int64)
+                in crowd_idx], dtype=np.int64)
 
         return {'bboxes': bbox,
                 'labels': labels,

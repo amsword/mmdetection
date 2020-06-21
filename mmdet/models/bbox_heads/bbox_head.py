@@ -6,6 +6,23 @@ from mmdet.core import (delta2bbox, multiclass_nms, bbox_target,
                         weighted_cross_entropy, weighted_smoothl1, accuracy)
 from ..registry import HEADS
 
+def create_cls_loss(classification_loss_type):
+    if classification_loss_type == 'CE':
+        return weighted_cross_entropy
+    elif classification_loss_type.startswith('IBCE'):
+       param = map(float, classification_loss_type[4:].split('_'))
+       from qd.qd_pytorch import IBCEWithLogitsNegLoss
+       return IBCEWithLogitsNegLoss(*param)
+    else:
+       raise NotImplementedError(classification_loss_type)
+
+def create_cls_activate(classification_loss_type):
+    if classification_loss_type == 'CE':
+        return lambda cls_score: F.softmax(cls_score, dim=1)
+    elif classification_loss_type.startswith('IBCE'):
+        return nn.Sigmoid()
+    else:
+       raise NotImplementedError(classification_loss_type)
 
 @HEADS.register_module
 class BBoxHead(nn.Module):
@@ -21,7 +38,9 @@ class BBoxHead(nn.Module):
                  num_classes=81,
                  target_means=[0., 0., 0., 0.],
                  target_stds=[0.1, 0.1, 0.2, 0.2],
-                 reg_class_agnostic=False):
+                 reg_class_agnostic=False,
+                 classification_loss_type='CE',
+                 ):
         super(BBoxHead, self).__init__()
         assert with_cls or with_reg
         self.with_avg_pool = with_avg_pool
@@ -45,6 +64,9 @@ class BBoxHead(nn.Module):
             out_dim_reg = 4 if reg_class_agnostic else 4 * num_classes
             self.fc_reg = nn.Linear(in_channels, out_dim_reg)
         self.debug_imgs = None
+        self.cls_loss_func = create_cls_loss(classification_loss_type)
+        self.cls_activate_func = create_cls_activate(classification_loss_type)
+        self.start_class = 1 if classification_loss_type in ['CE'] else 0
 
     def init_weights(self):
         if self.with_cls:
@@ -90,21 +112,42 @@ class BBoxHead(nn.Module):
              reduce=True):
         losses = dict()
         if cls_score is not None:
-            losses['loss_cls'] = weighted_cross_entropy(
+            losses['loss_cls'] = self.cls_loss_func(
                 cls_score, labels, label_weights, reduce=reduce)
             losses['acc'] = accuracy(cls_score, labels)
         if bbox_pred is not None:
-            pos_inds = labels > 0
-            if self.reg_class_agnostic:
-                pos_bbox_pred = bbox_pred.view(bbox_pred.size(0), 4)[pos_inds]
+            if labels.dim() == 1:
+                pos_inds = labels > 0
+                if self.reg_class_agnostic:
+                    pos_bbox_pred = bbox_pred.view(bbox_pred.size(0), 4)[pos_inds]
+                else:
+                    pos_bbox_pred = bbox_pred.view(bbox_pred.size(0), -1,
+                                                   4)[pos_inds, labels[pos_inds]]
+                loss = weighted_smoothl1(
+                    pos_bbox_pred,
+                    bbox_targets[pos_inds],
+                    bbox_weights[pos_inds],
+                    avg_factor=bbox_targets.size(0))
             else:
-                pos_bbox_pred = bbox_pred.view(bbox_pred.size(0), -1,
-                                               4)[pos_inds, labels[pos_inds]]
-            losses['loss_reg'] = weighted_smoothl1(
-                pos_bbox_pred,
-                bbox_targets[pos_inds],
-                bbox_weights[pos_inds],
-                avg_factor=bbox_targets.size(0))
+                x = torch.nonzero(labels > 0)
+                if x.numel() == 0:
+                    loss = 0
+                else:
+                    sampled_pos_inds_subset, labels_pos = x[:, 0], x[:, 1]
+                    if self.reg_class_agnostic:
+                        map_inds = torch.tensor([0, 1, 2, 3], device=bbox_pred.device)
+                    else:
+                        map_inds = 4 * labels_pos[:, None] + torch.tensor(
+                            [0, 1, 2, 3], device=bbox_pred.device)
+                    sampled_box_regression = bbox_pred[sampled_pos_inds_subset[:, None], map_inds]
+                    sampled_box_target = bbox_targets[sampled_pos_inds_subset]
+                    sampled_bbox_weights = bbox_weights[sampled_pos_inds_subset]
+                    loss = weighted_smoothl1(
+                        sampled_box_regression,
+                        sampled_box_target,
+                        sampled_bbox_weights,
+                        avg_factor=bbox_targets.size(0))
+            losses['loss_reg'] = loss
         return losses
 
     def get_det_bboxes(self,
@@ -117,7 +160,10 @@ class BBoxHead(nn.Module):
                        cfg=None):
         if isinstance(cls_score, list):
             cls_score = sum(cls_score) / float(len(cls_score))
-        scores = F.softmax(cls_score, dim=1) if cls_score is not None else None
+        if cls_score is not None:
+            scores = self.cls_activate_func(cls_score)
+        else:
+            scores = None
 
         if bbox_pred is not None:
             bboxes = delta2bbox(rois[:, 1:], bbox_pred, self.target_means,
@@ -133,7 +179,8 @@ class BBoxHead(nn.Module):
             return bboxes, scores
         else:
             det_bboxes, det_labels = multiclass_nms(
-                bboxes, scores, cfg.score_thr, cfg.nms, cfg.max_per_img)
+                bboxes, scores, cfg.score_thr, cfg.nms, cfg.max_per_img,
+                start_class=self.start_class)
 
             return det_bboxes, det_labels
 

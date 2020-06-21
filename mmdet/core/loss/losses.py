@@ -13,10 +13,14 @@ def weighted_nll_loss(pred, label, weight, avg_factor=None):
     return torch.sum(raw * weight)[None] / avg_factor
 
 
-def weighted_cross_entropy(pred, label, weight, avg_factor=None, reduce=True):
+def weighted_cross_entropy(pred, label, weight, avg_factor=None,
+        reduce=True, ignore_easy=None):
     if avg_factor is None:
         avg_factor = max(torch.sum(weight > 0).float().item(), 1.)
     raw = F.cross_entropy(pred, label, reduction='none')
+    if ignore_easy:
+        #weight[raw < ignore_easy] = 0
+        weight[raw > 100] = 0
     if reduce:
         return torch.sum(raw * weight)[None] / avg_factor
     else:
@@ -102,6 +106,8 @@ def weighted_smoothl1(pred, target, weight, beta=1.0, avg_factor=None):
 
 
 def accuracy(pred, target, topk=1):
+    if target.dim() == 2:
+        return torch.zeros(0)
     if isinstance(topk, int):
         topk = (topk, )
         return_single = True

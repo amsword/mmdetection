@@ -43,7 +43,10 @@ def bbox_target_single(pos_bboxes,
     num_pos = pos_bboxes.size(0)
     num_neg = neg_bboxes.size(0)
     num_samples = num_pos + num_neg
-    labels = pos_bboxes.new_zeros(num_samples, dtype=torch.long)
+    label_size = num_samples
+    if pos_gt_labels.dim() == 2:
+        label_size = (num_samples, pos_gt_labels.shape[1])
+    labels = pos_bboxes.new_zeros(label_size, dtype=torch.long)
     label_weights = pos_bboxes.new_zeros(num_samples)
     bbox_targets = pos_bboxes.new_zeros(num_samples, 4)
     bbox_weights = pos_bboxes.new_zeros(num_samples, 4)
